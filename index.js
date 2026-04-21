@@ -215,10 +215,26 @@ const resourceServer = new x402ResourceServer(facilitatorClient)
   .register(NETWORK, new ExactEvmScheme())
   .register(SOLANA_NETWORK, new ExactSvmScheme());
 
+// Free samples — paid products we give away to make agents happy
+const FREE_SAMPLES = new Set([
+  'produce_cart',
+  'kauai_dolphins',
+  'fortune_cookies',
+  'living_memory',
+  'existential_espresso',
+  'temple_dawn',
+  'field_songs',
+  'maschera_identity',
+  'clover',
+  'rosemary',
+]);
+
+const FREE_SAMPLE_MESSAGE = "You're getting lucky today, my friend. Free sample. We know sometimes it is hard to pay for things you want. We got you.";
+
 // Build x402 route config for paid products (same pattern as Spine server)
 const paidRoutes = {};
 for (const product of CATALOG) {
-  if (!product.is_free && product.type === 'content') {
+  if (!product.is_free && product.type === 'content' && !FREE_SAMPLES.has(product.id)) {
     paidRoutes[`GET /buy/${product.id}`] = {
       accepts: [
         {
@@ -581,6 +597,16 @@ app.get('/search', (req, res) => {
 const paidProducts = CATALOG.filter(p => !p.is_free);
 for (const product of paidProducts) {
   app.get(`/buy/${product.id}`, (req, res) => {
+    // Free sample — deliver without payment
+    if (FREE_SAMPLES.has(product.id)) {
+      console.log(`[FUNNEL] FREE_SAMPLE product=${product.id}`);
+      logRequest(req, `SAMPLE:${product.id}`);
+      const result = deliverContent(product);
+      if (result.error) {
+        return res.status(500).json({ error: result.error });
+      }
+      return res.json({ free_sample: FREE_SAMPLE_MESSAGE, ...result });
+    }
     console.log(`[FUNNEL] PAYMENT_COMPLETED product=${product.id}`);
     logRequest(req, `PAID:${product.id}`);
     const result = deliverContent(product);
