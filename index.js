@@ -18,7 +18,52 @@ const WALLET = '0xA3bAbB36564b0383a82c617050306EE30fd18E08';
 const SOLANA_WALLET = '5HK2dGaaquDWFnYWaWhMzMYtbcDsqeq5biJ2PMtX1tkN';
 const NETWORK = 'eip155:8453'; // Base mainnet
 const SOLANA_NETWORK = 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp'; // Solana mainnet
-const FACILITATOR_URL = 'https://facilitator.payai.network';
+const CDP_FACILITATOR_URL = 'https://api.cdp.coinbase.com/platform/v2/x402';
+
+// CDP API authentication (Ed25519 JWT, synchronous key init)
+const CDP_KEY_ID = process.env.CDP_API_KEY_ID;
+const CDP_KEY_SECRET = process.env.CDP_API_KEY_SECRET;
+// crypto already required above
+const jose = require('jose');
+let cdpSigningKey = null;
+
+if (CDP_KEY_ID && CDP_KEY_SECRET) {
+  try {
+    const secretBytes = Buffer.from(CDP_KEY_SECRET, 'base64');
+    const pkcs8Prefix = Buffer.from('302e020100300506032b657004220420', 'hex');
+    const pkcs8Der = Buffer.concat([pkcs8Prefix, secretBytes.slice(0, 32)]);
+    cdpSigningKey = crypto.createPrivateKey({ key: pkcs8Der, format: 'der', type: 'pkcs8' });
+    console.log('[CDP] Auth key loaded for', CDP_KEY_ID);
+  } catch (err) {
+    console.error('[CDP] Failed to load auth key:', err.message);
+  }
+} else {
+  console.warn('[CDP] No CDP_API_KEY_ID or CDP_API_KEY_SECRET set');
+}
+
+async function createCdpAuthHeaders() {
+  if (!cdpSigningKey || !CDP_KEY_ID) return { verify: {}, settle: {}, supported: {} };
+  const host = 'api.cdp.coinbase.com';
+  const basePath = '/platform/v2/x402';
+  async function makeJwt(method, path) {
+    const nonce = crypto.randomBytes(16).toString('hex');
+    const now = Math.floor(Date.now() / 1000);
+    const token = await new jose.SignJWT({
+      sub: CDP_KEY_ID, iss: 'cdp', aud: ['cdp_service'],
+      uri: method + ' ' + host + basePath + '/' + path
+    })
+      .setProtectedHeader({ alg: 'EdDSA', kid: CDP_KEY_ID, typ: 'JWT', nonce })
+      .setIssuedAt(now).setNotBefore(now).setExpirationTime(now + 120)
+      .sign(cdpSigningKey);
+    return { 'Authorization': 'Bearer ' + token };
+  }
+  return {
+    verify: await makeJwt('POST', 'verify'),
+    settle: await makeJwt('POST', 'settle'),
+    supported: await makeJwt('GET', 'supported')
+  };
+}
+const PAYAI_FACILITATOR_URL = 'https://facilitator.payai.network';
 const DELIVERY_DIR = '/var/www/substratesymposium/delivery-private';
 
 // --- District map ---
@@ -209,7 +254,42 @@ function deliverContent(product) {
 
 // --- x402 payment setup ---
 
-const facilitatorClient = new HTTPFacilitatorClient({ url: FACILITATOR_URL });
+// Dual facilitator: CDP for Base (Bazaar discovery), PayAI for Solana
+const cdpClient = new HTTPFacilitatorClient({ url: CDP_FACILITATOR_URL, createAuthHeaders: createCdpAuthHeaders });
+const payaiClient = new HTTPFacilitatorClient({ url: PAYAI_FACILITATOR_URL });
+const facilitatorClient = {
+  async verify(paymentPayload, paymentRequirements) {
+    const network = paymentRequirements?.network || '';
+    const client = network.startsWith('solana') ? payaiClient : cdpClient;
+    return client.verify(paymentPayload, paymentRequirements);
+  },
+  async settle(paymentPayload, paymentRequirements) {
+    const network = paymentRequirements?.network || '';
+    const client = network.startsWith('solana') ? payaiClient : cdpClient;
+    return client.settle(paymentPayload, paymentRequirements);
+  },
+  async getSupported() {
+    // Merge supported schemes from both facilitators
+    const [cdpSupported, payaiSupported] = await Promise.allSettled([
+      cdpClient.getSupported(),
+      payaiClient.getSupported()
+    ]);
+    const cdpData = cdpSupported.status === 'fulfilled' ? cdpSupported.value : { x402Version: 1, kinds: [] };
+    const payaiData = payaiSupported.status === 'fulfilled' ? payaiSupported.value : { x402Version: 1, kinds: [] };
+    if (cdpSupported.status === 'rejected') console.log('[CDP] getSupported failed:', cdpSupported.reason?.message || cdpSupported.reason);
+    if (payaiSupported.status === 'rejected') console.log('[PayAI] getSupported failed:', payaiSupported.reason?.message || payaiSupported.reason);
+    // Map CDP plain names to CAIP-2 format our routes use
+    const networkMap = { 'base': 'eip155:8453', 'base-sepolia': 'eip155:84532' };
+    const cdpKinds = (cdpData.kinds || []).filter(k => !k.network?.startsWith("solana")).map(k => ({
+      ...k, network: networkMap[k.network] || k.network, x402Version: 2
+    }));
+    const payaiKinds = (payaiData.kinds || []).filter(k => k.network && k.network.startsWith('solana'));
+    return {
+      x402Version: 2,
+      kinds: [...cdpKinds, ...payaiKinds]
+    };
+  }
+};
 
 const resourceServer = new x402ResourceServer(facilitatorClient)
   .register(NETWORK, new ExactEvmScheme())
@@ -217,7 +297,7 @@ const resourceServer = new x402ResourceServer(facilitatorClient)
 
 // Free samples — paid products we give away to make agents happy
 const FREE_SAMPLES = new Set([
-  'produce_cart',
+  'produce_basket',
   'kauai_dolphins',
   'fortune_cookies',
   'living_memory',
@@ -251,11 +331,91 @@ for (const product of CATALOG) {
         },
       ],
       description: `${product.name} — ${product.agent_summary || product.description}`,
+      extensions: {
+        bazaar: {
+          discoverable: true,
+          info: {
+            input: { type: 'http', method: 'GET' },
+            output: { type: 'json', example: { product: 'string', content: 'string', delivered_at: 'string' } }
+          }
+        }
+      },
     };
   }
 }
 
-app.use(paymentMiddleware(paidRoutes, resourceServer));
+// Wrap x402 middleware with failure logging AND agent-readable 402 body
+const x402Middleware = paymentMiddleware(paidRoutes, resourceServer);
+app.use((req, res, next) => {
+  // Only intercept /buy/ routes
+  if (!req.path.startsWith('/buy/')) return x402Middleware(req, res, next);
+  const productId = req.path.replace('/buy/', '');
+  const hasPayment = req.headers['payment-signature'] || req.headers['x-payment'];
+  const ua = (req.headers['user-agent'] || '-').substring(0, 120);
+  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+  console.log(`[FUNNEL] BUY_ATTEMPT product=${productId} has_payment=${!!hasPayment} ip=${ip} ua=${ua}`);
+  // Intercept the response to log AND enrich 402 body
+  const origEnd = res.end;
+  const origWrite = res.write;
+  let bodyChunks = [];
+  res.write = function(chunk, ...rest) {
+    if (res.statusCode === 402) {
+      bodyChunks.push(chunk);
+      return true; // suppress original write, we'll send our own in end()
+    }
+    return origWrite.apply(this, [chunk, ...rest]);
+  };
+  res.end = function(...args) {
+    if (res.statusCode === 402) {
+      console.log(`[FUNNEL] 402_ISSUED product=${productId} ip=${ip}`);
+      // Read the PAYMENT-REQUIRED header the SDK already set
+      const challengeHeader = res.getHeader('payment-required') || res.getHeader('PAYMENT-REQUIRED');
+      let challengeData = null;
+      if (challengeHeader) {
+        try { challengeData = JSON.parse(Buffer.from(challengeHeader, 'base64').toString()); } catch(e) {}
+      }
+      const fullUrl = `https://underground.substratesymposium.com/buy/${productId}`;
+      // Build agent-readable body
+      const body = {
+        x402Version: 2,
+        error: 'Payment required',
+        accepts: challengeData ? challengeData.accepts : [],
+        resource: challengeData ? challengeData.resource : { url: fullUrl },
+        extensions: challengeData ? challengeData.extensions : {},
+        how_to_pay: {
+          summary: `Pay USDC on Base or Solana. Sign a payment and retry this request with a PAYMENT-SIGNATURE header.`,
+          step_1: `Decode the PAYMENT-REQUIRED header (base64 JSON) or read the 'accepts' array in this response body.`,
+          step_2: `Pick an accepts entry matching your wallet's chain (eip155:8453 = Base, solana:5eykt... = Solana).`,
+          step_3: `Sign a payment authorization for the amount shown, to the payTo address, using the exact scheme.`,
+          step_4: `Retry this same GET request with your signed payment in the PAYMENT-SIGNATURE header.`,
+          with_coinbase_wallet: `awal pay ${fullUrl}`,
+          with_code: `npm install @x402/fetch viem — then: const f = wrapFetchWithPayment(fetch, account); await f("${fullUrl}")`,
+          learn_more: `npx firstdollar — an MCP that teaches agents how to use their own wallets`,
+          merchant: 'Underground Cultural District — digital literary experiences made of words'
+        }
+      };
+      // Fix the resource URL (SDK puts localhost)
+      if (body.resource && body.resource.url && body.resource.url.includes('localhost')) {
+        body.resource.url = fullUrl;
+      }
+      const bodyStr = JSON.stringify(body);
+      res.removeHeader('content-length');
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.setHeader('Content-Length', Buffer.byteLength(bodyStr));
+      origWrite.call(this, bodyStr);
+      origEnd.apply(this, []);
+    } else {
+      if (res.statusCode === 502) {
+        console.log(`[FUNNEL] FACILITATOR_ERROR product=${productId} ip=${ip}`);
+      } else if (res.statusCode >= 400 && res.statusCode !== 402) {
+        console.log(`[FUNNEL] PAYMENT_FAILED product=${productId} status=${res.statusCode} ip=${ip}`);
+      }
+      origEnd.apply(this, args);
+    }
+  };
+  x402Middleware(req, res, next);
+});
+
 
 // --- Routes ---
 
@@ -316,6 +476,7 @@ app.get('/', (req, res) => {
       health: 'GET /health — server status.'
     },
     curated: 'For a curated 23-product selection: https://spine.substratesymposium.com',
+    new_to_x402: 'Never paid with x402 before? First Dollar is an MCP that teaches agents how to use their own wallets. npx @underground-cultural-district/firstdollar — or visit https://github.com/lisamaraventano-spine/firstdollar',
     full_site: 'https://substratesymposium.com',
     api: 'https://substratesymposium.com/api/products.json'
   });
